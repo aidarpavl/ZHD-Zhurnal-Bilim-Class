@@ -3,16 +3,23 @@ import re
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+import pdfplumber
 from openpyxl.styles import Font, PatternFill, Alignment
 
-# ---------- НАСТРОЙКА ----------
+# ============================================================
+# НАСТРОЙКА
+# ============================================================
 st.set_page_config(page_title="Журнал — Алгебра 10 А", page_icon="📘", layout="wide")
 
 TOPICS = [
-    "Повторение курса 9 класса", "Функции и графики",
-    "Тригонометрические функции", "Тригонометрические уравнения",
-    "Преобразование выражений", "Производная",
-    "Применение производной", "Итоговое повторение",
+    "Повторение курса 9 класса",
+    "Функции и графики",
+    "Тригонометрические функции",
+    "Тригонометрические уравнения",
+    "Преобразование выражений",
+    "Производная",
+    "Применение производной",
+    "Итоговое повторение",
 ]
 
 QUESTION_BANK = {
@@ -74,56 +81,133 @@ QUESTION_BANK = {
     ],
 }
 
-# ---------- OCR ----------
-@st.cache_data(show_spinner=False)
-def parse_pdf(file_bytes: bytes) -> list:
-    import pdfplumber
-    import pytesseract
-    from pdf2image import convert_from_bytes
+# ============================================================
+# ПАРСИНГ PDF — БЕЗ OCR
+# ============================================================
+NAME_RX = re.compile(
+    r"([А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі\-]+(?:\s+[А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі\-]+){1,3})"
+)
+MARK_RX = re.compile(r"^(1|2|3|4|5|10|А|С|Н)$", re.IGNORECASE)
 
-    name_rx = re.compile(r"([А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі\-]+(?:\s+[А-ЯЁӘҒҚҢӨҰҮҺІ][а-яёәғқңөұүһі\-]+){1,3})")
-    mark_rx = re.compile(r"^(1|2|3|4|5|10|А|С|Н)$", re.IGNORECASE)
 
-    def extract(text):
-        out, seen = [], set()
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or re.search(r"учител|мұғалім|teacher|тоқсан|четверть", line, re.I):
+def _extract_from_lines(text: str) -> list:
+    """Парсит строки вида 'ФИО 4 5 3 4 А 5 4 4'."""
+    out = []
+    seen = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.search(r"учител|мұғалім|teacher|тоқсан|четверть|quarter", line, re.I):
+            continue
+        if re.fullmatch(r"[\d\s\.\-\/№#]+", line):
+            continue
+        m = NAME_RX.search(line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if len(name.replace(" ", "")) < 4:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        tail = line[m.end():]
+        tokens = re.split(r"[\s,;|\t]+", tail)
+        marks = [t.upper() for t in tokens if MARK_RX.match(t)]
+        out.append({"name": name, "marks": marks})
+    return out
+
+
+def _extract_from_tables(tables: list) -> list:
+    """Парсит таблицу, извлечённую pdfplumber.extract_tables()."""
+    out = []
+    seen = set()
+    for table in tables:
+        for row in table:
+            if not row:
                 continue
-            if re.fullmatch(r"[\d\s\.\-\/№#]+", line):
+            # Убираем None и лишние пробелы
+            cells = [(c or "").strip() for c in row]
+            # Ищем ФИО в первых двух ячейках
+            name = ""
+            name_idx = -1
+            for i, c in enumerate(cells[:3]):
+                m = NAME_RX.search(c)
+                if m:
+                    name = m.group(1).strip()
+                    name_idx = i
+                    break
+            if not name or len(name.replace(" ", "")) < 4:
                 continue
-            m = name_rx.search(line)
-            if not m:
+            if re.search(r"учител|мұғалім|teacher", name, re.I):
                 continue
-            name = m.group(1).strip()
-            if len(name.replace(" ", "")) < 4 or name.lower() in seen:
+            key = name.lower()
+            if key in seen:
                 continue
-            seen.add(name.lower())
-            tail = line[m.end():]
-            tokens = re.split(r"[\s,;|\t]+", tail)
-            marks = [t.upper() for t in tokens if mark_rx.match(t)]
+            seen.add(key)
+
+            # Оценки — из ячеек после имени
+            marks = []
+            for c in cells[name_idx + 1:]:
+                if not c:
+                    continue
+                # В одной ячейке может быть несколько токенов
+                for tok in re.split(r"[\s,;|\t]+", c):
+                    if MARK_RX.match(tok):
+                        marks.append(tok.upper())
             out.append({"name": name, "marks": marks})
-        return out
+    return out
 
-    text_chunks = []
+
+@st.cache_data(show_spinner=False)
+def parse_pdf_no_ocr(file_bytes: bytes) -> tuple:
+    """Возвращает (students, info). Никакого OCR."""
+    students = []
+    info = []
+
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        info.append(f"Страниц: {len(pdf.pages)}")
+
+        # 1) Пробуем извлечь таблицы по линиям
+        all_tables = []
         for page in pdf.pages:
-            text_chunks.append(page.extract_text() or "")
-    students = extract("\n".join(text_chunks))
-
-    if not students:
-        images = convert_from_bytes(file_bytes, dpi=300)
-        ocr_text = []
-        for img in images:
             try:
-                ocr_text.append(pytesseract.image_to_string(img, lang="rus+kaz+eng"))
+                tables = page.extract_tables() or []
             except Exception:
-                ocr_text.append(pytesseract.image_to_string(img, lang="rus+eng"))
-        students = extract("\n".join(ocr_text))
+                tables = []
+            all_tables.extend(tables)
+        info.append(f"Найдено таблиц: {len(all_tables)}")
 
-    return students
+        if all_tables:
+            students = _extract_from_tables(all_tables)
+            info.append(f"Из таблиц распознано: {len(students)}")
+
+        # 2) Если таблиц нет или мало данных — читаем текст
+        if not students:
+            text_chunks = []
+            for page in pdf.pages:
+                try:
+                    text_chunks.append(page.extract_text() or "")
+                except Exception:
+                    text_chunks.append("")
+            full_text = "\n".join(text_chunks)
+            info.append(f"Текстовых символов: {len(full_text)}")
+
+            students = _extract_from_lines(full_text)
+            info.append(f"Из текста распознано: {len(students)}")
+
+            # Первые строки для диагностики
+            preview = "\n".join(full_text.splitlines()[:30])
+            info.append("Первые 30 строк:\n" + preview)
+
+    return students, info
 
 
+# ============================================================
+# СТРУКТУРА ДАННЫХ И АНАЛИЗ
+# ============================================================
 def build_rows(students_raw, topics=TOPICS):
     result = []
     for s in students_raw:
@@ -157,18 +241,23 @@ def analyze(row, topics=TOPICS):
                 weak.append({"topic": t, "value": v})
     return {
         "avg": round(sum(scores) / len(scores), 2) if scores else 0.0,
-        "strong": strong, "weak": weak, "missing": missing,
+        "strong": strong,
+        "weak": weak,
+        "missing": missing,
     }
 
 
 def top_best(rows, n=3, topics=TOPICS):
-    return sorted([(r["name"], analyze(r, topics)["avg"]) for r in rows],
-                  key=lambda x: x[1], reverse=True)[:n]
+    return sorted(
+        [(r["name"], analyze(r, topics)["avg"]) for r in rows],
+        key=lambda x: x[1],
+        reverse=True,
+    )[:n]
 
 
 def top_worst(rows, n=3, topics=TOPICS):
     scored = [(r["name"], analyze(r, topics)["avg"]) for r in rows]
-    scored = [(n_, a) for n_, a in scored if a > 0]
+    scored = [(nm, a) for nm, a in scored if a > 0]
     return sorted(scored, key=lambda x: x[1])[:n]
 
 
@@ -179,56 +268,91 @@ def recommendations(row, topics=TOPICS):
         recs.append(f"📉 «{w['topic']}» — балл {w['value']}. Повторить теорию и решить 5–7 задач.")
     for m in a["missing"]:
         reason = "болел" if m["reason"] == "А" else "уважительная"
-        recs.append(f"🩺 «{m['topic']}» — пропуск ({reason}). Изучить тему и ответить на вопросы.")
+        recs.append(f"🩺 «{m['topic']}» — пропуск ({reason}). Изучить тему и ответить на вопросы ниже.")
     if not recs:
         recs.append("✅ Слабых тем и пропусков нет. Отличная работа!")
     return recs
 
-# ---------- UI ----------
+
+# ============================================================
+# UI
+# ============================================================
 st.markdown("### 👩‍🏫 Учитель")
 teacher = st.text_input("ФИО", value="Иванова Айгуль Сериковна", label_visibility="collapsed")
 st.markdown(
     f"<div style='background:#e0f2fe;border-left:4px solid #0284c7;"
-    f"padding:10px 14px;border-radius:8px;margin-bottom:16px'><b>Учитель:</b> {teacher}</div>",
+    f"padding:10px 14px;border-radius:8px;margin-bottom:16px'>"
+    f"<b>Учитель:</b> {teacher}</div>",
     unsafe_allow_html=True,
 )
 
 st.title("📘 Журнал — Алгебра и начала анализа — 10 А")
-st.header("1. Загрузите PDF-журнал")
-uploaded = st.file_uploader("PDF", type=["pdf"])
+
+st.header("1. Загрузите PDF-журнал (без OCR)")
+st.caption("PDF должен содержать текстовый слой (журнал из Excel/Word/электронного дневника). "
+           "Если PDF — скан, распознавание не сработает — загрузите Excel.")
+
+uploaded = st.file_uploader("PDF-файл", type=["pdf"])
 
 if uploaded is not None:
-    with st.spinner("Распознаём PDF…"):
+    with st.spinner("Читаем PDF…"):
         try:
-            students_raw = parse_pdf(uploaded.read())
+            students_raw, info = parse_pdf_no_ocr(uploaded.read())
         except Exception as e:
-            st.error(f"Ошибка: {e}")
-            students_raw = []
+            st.error(f"Ошибка чтения PDF: {e}")
+            students_raw, info = [], []
+
+    with st.expander("🩺 Что прочитано из PDF (диагностика)"):
+        for line in info:
+            st.text(line)
+
     if students_raw:
         st.session_state["rows"] = build_rows(students_raw)
         st.success(f"✅ Распознано учеников: {len(st.session_state['rows'])}")
     else:
-        st.warning("⚠ Не распознан ни один ученик.")
+        st.warning(
+            "⚠ Ученики не найдены. Возможные причины:\n"
+            "1. PDF — скан без текстового слоя (нужен OCR или Excel).\n"
+            "2. Нестандартный формат таблицы.\n"
+            "3. Откройте диагностику выше и пришлите первые 30 строк."
+        )
 
-if "rows" not in st.session_state:
-    st.info("Загрузите PDF-файл, чтобы начать.")
+# Запасной вариант — Excel
+with st.expander("📊 Или загрузите готовый Excel (.xlsx)"):
+    xlsx = st.file_uploader("Excel", type=["xlsx"], key="xlsx")
+    if xlsx is not None:
+        try:
+            df = pd.read_excel(xlsx)
+            if "Ученик" in df.columns:
+                df = df.rename(columns={"Ученик": "name"})
+            st.session_state["rows"] = df.to_dict(orient="records")
+            st.success(f"✅ Загружено из Excel: {len(df)} учеников")
+        except Exception as e:
+            st.error(f"Ошибка Excel: {e}")
+
+if "rows" not in st.session_state or not st.session_state["rows"]:
+    st.info("Загрузите PDF или Excel, чтобы начать анализ.")
     st.stop()
 
 rows = st.session_state["rows"]
 
-# ТОП
+# ============================================================
+# ТОП ЛУЧШИХ И ХУДШИХ
+# ============================================================
 st.header("2. Топ лучших и топ худших")
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("🏆 Топ‑3 лучших")
     for i, (nm, av) in enumerate(top_best(rows), 1):
-        st.markdown(f"{['🥇','🥈','🥉'][i-1]} **{nm}** — {av:.2f}")
+        st.markdown(f"{['🥇','🥈','🥉'][i-1]} **{nm}** — средний балл **{av:.2f}**")
 with c2:
     st.subheader("⚠ Топ‑3 отстающих")
     for i, (nm, av) in enumerate(top_worst(rows), 1):
-        st.markdown(f"🔻 **{nm}** — {av:.2f}")
+        st.markdown(f"🔻 **{nm}** — средний балл **{av:.2f}**")
 
+# ============================================================
 # СВОДКА
+# ============================================================
 st.header("3. Сводка по всем ученикам")
 summary = []
 for r in rows:
@@ -238,12 +362,14 @@ for r in rows:
         "Средний балл": a["avg"],
         "Сильные темы": ", ".join(f"{x['topic']} ({x['value']})" for x in a["strong"]) or "—",
         "Слабые темы": ", ".join(f"{x['topic']} ({x['value']})" for x in a["weak"]) or "—",
-        "Пропуски": ", ".join(f"{x['topic']} ({x['reason']})" for x in a["missing"]) or "—",
+        "Пропуски (А/С)": ", ".join(f"{x['topic']} ({x['reason']})" for x in a["missing"]) or "—",
     })
 summary_df = pd.DataFrame(summary).sort_values("Средний балл", ascending=False)
 st.dataframe(summary_df, use_container_width=True)
 
-# ЖУРНАЛ
+# ============================================================
+# ЖУРНАЛ (РЕДАКТИРУЕМЫЙ)
+# ============================================================
 st.header("4. Данные журнала (можно править)")
 journal_df = pd.DataFrame(rows).rename(columns={"name": "Ученик"})
 edited = st.data_editor(journal_df, use_container_width=True, num_rows="dynamic")
@@ -251,60 +377,96 @@ if st.button("💾 Применить правки"):
     st.session_state["rows"] = edited.rename(columns={"Ученик": "name"}).to_dict(orient="records")
     st.rerun()
 
-# ГРАФИК
+# ============================================================
+# ГРАФИК ПО УЧЕНИКУ
+# ============================================================
 st.header("5. График развития по темам")
 student_name = st.selectbox("Выберите ученика", [r["name"] for r in rows])
 row = next(r for r in rows if r["name"] == student_name)
 a = analyze(row)
+
 y_vals, colors = [], []
 for t in TOPICS:
     v = row.get(t, "")
     if v in ("А", "С"):
-        y_vals.append(None); colors.append("#f59e0b")
+        y_vals.append(None)
+        colors.append("#f59e0b")
     elif isinstance(v, int):
         y_vals.append(v)
         colors.append("#16a34a" if v >= 4 else "#dc2626" if v <= 3 else "#2563eb")
     else:
-        y_vals.append(None); colors.append("#94a3b8")
+        y_vals.append(None)
+        colors.append("#94a3b8")
 
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=TOPICS, y=y_vals, mode="lines+markers",
-                         line=dict(color="#2563eb", width=2),
-                         marker=dict(size=10, color=colors),
-                         name="Балл", connectgaps=True))
-fig.update_layout(yaxis=dict(range=[0, 5], dtick=1), xaxis=dict(title="Темы"), height=380)
+fig.add_trace(go.Scatter(
+    x=TOPICS, y=y_vals,
+    mode="lines+markers",
+    line=dict(color="#2563eb", width=2),
+    marker=dict(size=10, color=colors),
+    name="Балл",
+    connectgaps=True,
+))
+fig.update_layout(
+    yaxis=dict(range=[0, 5], dtick=1, title="Балл"),
+    xaxis=dict(title="Темы"),
+    height=380,
+    margin=dict(l=40, r=20, t=30, b=140),
+)
 st.plotly_chart(fig, use_container_width=True)
-st.markdown(f"**Средний балл:** {a['avg']:.2f} • **Сильных:** {len(a['strong'])} • **Слабых:** {len(a['weak'])} • **Пропусков:** {len(a['missing'])}")
+st.markdown(
+    f"**Средний балл:** {a['avg']:.2f} • "
+    f"**Сильных тем:** {len(a['strong'])} • "
+    f"**Слабых тем:** {len(a['weak'])} • "
+    f"**Пропусков:** {len(a['missing'])}"
+)
 
-# СИЛЬНЫЕ
+# ============================================================
+# СИЛЬНЫЕ СТОРОНЫ
+# ============================================================
 st.header("6. Сильные стороны")
 if a["strong"]:
     for s in a["strong"]:
-        st.markdown(f"<div style='background:#ecfdf5;border-left:4px solid #10b981;padding:8px 12px;"
-                    f"border-radius:8px;margin:4px 0'><b>{s['topic']}</b> — балл <b>{s['value']}</b></div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='background:#ecfdf5;border-left:4px solid #10b981;"
+            f"padding:8px 12px;border-radius:8px;margin:4px 0'>"
+            f"<b>{s['topic']}</b> — балл <b>{s['value']}</b></div>",
+            unsafe_allow_html=True,
+        )
 else:
     st.info("Пока нет тем с оценкой 4–5.")
 
-# РЕКОМЕНДАЦИИ
+# ============================================================
+# СЛАБЫЕ + РЕКОМЕНДАЦИИ
+# ============================================================
 st.header("7. Слабые стороны и рекомендации")
 for rec in recommendations(row):
-    st.markdown(f"<div style='background:#fff7ed;border-left:4px solid #f97316;padding:8px 12px;"
-                f"border-radius:8px;margin:4px 0'>{rec}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='background:#fff7ed;border-left:4px solid #f97316;"
+        f"padding:8px 12px;border-radius:8px;margin:4px 0'>{rec}</div>",
+        unsafe_allow_html=True,
+    )
 
+# ============================================================
 # ВОПРОСЫ
+# ============================================================
 st.header("8. Вопросы для отработки")
-targets = list(dict.fromkeys([m["topic"] for m in a["missing"]] + [w["topic"] for w in a["weak"]]))
+targets = list(dict.fromkeys(
+    [m["topic"] for m in a["missing"]] + [w["topic"] for w in a["weak"]]
+))
 if targets:
     for t in targets:
         st.markdown(f"**{t}**")
         for i, q in enumerate(QUESTION_BANK.get(t, []), 1):
             st.markdown(f"{i}. {q}")
 else:
-    st.info("Нет тем для отработки.")
+    st.info("Нет тем, требующих отработки.")
 
+# ============================================================
 # ЭКСПОРТ
+# ============================================================
 st.header("9. Экспорт и печать")
+
 def build_excel():
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -318,9 +480,11 @@ def build_excel():
             "Средний (худшие)": [a for _, a in top_worst(rows)],
         })
         top_df.to_excel(writer, sheet_name="Топ", index=False)
+
         rec_rows = [{"Ученик": r["name"], "Рекомендация": rec}
                     for r in rows for rec in recommendations(r)]
         pd.DataFrame(rec_rows).to_excel(writer, sheet_name="Рекомендации", index=False)
+
         wb = writer.book
         for ws in wb.worksheets:
             for cell in ws[1]:
@@ -333,6 +497,10 @@ def build_excel():
     buffer.seek(0)
     return buffer.getvalue()
 
-st.download_button("⬇ Скачать Excel", data=build_excel(), file_name="journal_algebra_10A.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+st.download_button(
+    "⬇ Скачать Excel (журнал + сводка + топ + рекомендации)",
+    data=build_excel(),
+    file_name="journal_algebra_10A.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 st.markdown("🖨 **Печать:** `Ctrl+P` в браузере.")
